@@ -453,6 +453,23 @@ def create_reference_mapping_payload(data, token, response):
     }
 
 
+def create_deal_note_payload(data, token):
+    processed_payload = filter_payload_keys(data, "pk", "sk", "id")
+    processed_payload = json.loads(json.dumps(processed_payload, cls=DecimalEncoder))
+    return {
+        "url": f"{args['mock_url']}/deal_notes",
+        "headers": {'Authorization': token, 'x-mock-response-code': "201"},
+        "payload": processed_payload
+    }
+
+def create_deal_task_payload(data, token):
+    processed_payload = filter_payload_keys(data, "pk", "sk", "id")
+    processed_payload = json.loads(json.dumps(processed_payload, cls=DecimalEncoder))
+    return {
+        "url": f"{args['mock_url']}/deal_tasks",
+        "headers": {'Authorization': token, 'x-mock-response-code': "201"},
+        "payload": processed_payload
+    }
 
 # ---- ceate_contact_payload-------------------------------------------------------
 def create_contact_payload(data, token):
@@ -874,7 +891,9 @@ def processEntity(item, token):
         "contact_note": process_contact_note,
         "contact_task": process_contact_task,
         "lender": process_lender,
-        "deal": process_deal
+        "deal": process_deal,
+        "deal_note": process_deal_note,
+        "deal_task": process_deal_task
     }
     pk = item.get("pk")
     process_function = entity_map.get(pk)
@@ -1056,6 +1075,24 @@ def process_deal(record, token):
         token = new_token if new_token else token
         updateMapping(response, record, sent_payload, sk_id)
     
+
+def process_deal_note(record, token):
+    deal_note_payload = create_deal_note_payload(record, token)
+    result = handle_failed_payload_creation(record, deal_note_payload)
+    if result: return
+
+    response, new_token, sent_payload = executeApi(deal_note_payload, token)
+    token = new_token if new_token else token
+    updateMapping(response, record, sent_payload)
+
+def process_deal_task(record, token):
+    deal_task_payload = create_deal_task_payload(record, token)
+    result = handle_failed_payload_creation(record, deal_task_payload)
+    if result: return
+
+    response, new_token, sent_payload = executeApi(deal_task_payload, token)
+    token = new_token if new_token else token
+    updateMapping(response, record, sent_payload)
 
 def process_contact(record, token):
     contact_payload = create_contact_payload(record, token)

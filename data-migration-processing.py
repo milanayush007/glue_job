@@ -130,6 +130,94 @@ def updateMapping(result, item, sent_payload, sk_id = None):
         print(f"Error processing API result: {str(e)}")
 
 
+# ----process-bulk-response-------------------------------------------------------   
+def exectueBulkAPI(api_config, token,  max_retries=2):
+    for attempt in range(max_retries):
+        try:
+
+            response = requests.post(
+                api_config["url"], 
+                json=api_config["payload"], 
+                headers=api_config["headers"]
+            )
+            print(f"Response status code: {response.status_code}")
+            print(f"Response body: {response.text}")
+            
+            # Handle token expiration
+            if response.status_code == 401 and attempt < max_retries - 1:
+                print("Token expired. Generating new token...")
+                new_token = get_auth_token(args['auth_url'], args['client_id'], 
+                                         args['username'], args['password'], 
+                                         args['client_secret'])
+                if not new_token:
+                    return {'isSuccess': False, 'error': 'Failed to obtain new auth token'}, None, api_config["payload"]
+                token = new_token
+                api_config["headers"]['Authorization'] = token
+                time.sleep(1)
+                continue
+            
+            response.raise_for_status()
+            result = process_bulk_response(response.json())
+            return result, token, api_config["payload"]
+            
+        except requests.exceptions.RequestException as e:
+            print(e)
+            # if response.status_code != 401 or attempt == max_retries - 1:
+            return {'isSuccess': False, 'error': str(e)}, token, api_config["payload"]
+    
+    return {'isSuccess': False, 'error': 'Max retries reached'}, token, api_config["payload"]
+
+
+
+def updateMappingForBulkResponses(response_json, item, sent_payload, sk_id):
+    """
+    Processes the bulk API result and updates DynamoDB accordingly.
+    """
+    try:
+        if 'result' in response_json:
+            results = response_json['result']
+            for result in results:
+                status_code = result.get('statusCode')
+                is_success = status_code == 200
+                pk = item.get('pk')
+                sk_base = str(item.get('sk'))
+                content_json = json.dumps(sent_payload)
+
+                if is_success:
+                    api_response = result.get('response', {})
+                    if new_id := get_v2_id(api_response):
+                        success = create_dynamo_record(
+                            table=table,
+                            pk=pk,
+                            sk=f"success#{sk_id}#{uuid.uuid4()}",
+                            v1_value=sk_base,
+                            result='success',
+                            payload=content_json,
+                            v2_value=new_id,
+                            response=api_response
+                        )
+                        if success:
+                            print(f"Successfully processed record with v2_id: {new_id}")
+                    else:
+                        print("No v2_id found in successful response")
+                else:
+                    create_dynamo_record(
+                        table=table,
+                        pk=pk,
+                        sk=f"failed#{sk_base}#{sub_entity}#{uuid.uuid4()}",
+                        v1_value=sk_base,
+                        result='failed',
+                        payload=content_json,
+                        error_msg=str(result.get('error', 'Unknown error')),
+                        response=result.get('response', {})
+                    )
+                    print(f"API call failed: {result.get('error', 'Unknown error')}")
+        else:
+            print("Invalid response format")
+    except Exception as e:
+        print(f"Error processing bulk API result: {str(e)}")
+
+
 # ----payload creation functions-------------------------------------------------------
 
 def create_organization_payload(record, token):
@@ -294,20 +382,30 @@ def create_lender_payload(data, token):
         }
     }
 
-def create_bdm_payload(data, token, response):  
-    bdm_info = data
+def create_bdm_payload(bdm_list, token, response):
+    bdm_payload_list = []
+    for bdm_info in bdm_list:
+        bdm_payload = {
+            "lender_id": response.get("response", {}).get("data", {}).get("loan_lender_application_id"),
+            "email_address": bdm_info.get("email_address"),
+            "name": bdm_info.get("name"),
+            "office_number": bdm_info.get("office_number"),
+            "province": bdm_info.get("province"),
+            "title": bdm_info.get("title")
+        }
+        bdm_payload_list.append(bdm_payload)
+
+    payload = {
+        "record_create_list": bdm_payload_list
+    }
+
     return {
         "url": args['bdm_url'],
         "headers": {'Authorization': token},
         "payload": {
-            "data": {
-                "lender_id": response.get("response", {}).get("data", {}).get("loan_lender_application_id"),
-                "email_address": bdm_info.get("email_address"),
-                "name": bdm_info.get("name"),
-                "office_number": bdm_info.get("office_number"),
-                "province": bdm_info.get("province"),
-                "title": bdm_info.get("title")
-            }
+            "wfe_app_id": "infin8v2",
+            "entity_id": "",
+            "api_request": json.dumps(payload)
         }
     }
 
@@ -357,98 +455,147 @@ def create_document_payload(data, token):
         "payload": document_payload
     }
 
-def create_fees_payload(data, token, response):
-    fees_payload = data
-    fees_payload["loan_application_id"] = response.get("response", {}).get("data", {}).get("loan_application_id")
-    fees_payload = json.loads(json.dumps(fees_payload, cls=DecimalEncoder))
+def create_fees_payload(fees_list, token, response):
+    fees_payload_list = []
+    for fee_info in fees_list:
+        fee_payload = {
+            "fee_id": fee_info.get("fee_id"),
+            "amount": fee_info.get("amount"),
+            "description": fee_info.get("description")
+        }
+        fees_payload_list.append(fee_payload)
+
+    payload = {
+        "record_create_list": fees_payload_list
+    }
+
     return {
-        "url": f"{args['mock_url']}/fees",
-        "headers": {'Authorization': token, 'x-mock-response-code': "201"},
+        "url": args['fees_url'],
+        "headers": {'Authorization': token},
         "payload": {
             "wfe_app_id": "infin8v2",
-            "entity_id": "fees",
-            "api_request": json.dumps(fees_payload)
+            "entity_id": "",
+            "api_request": json.dumps(payload)
         }
     }
 
-def create_participants_payload(data, token, response):
-    participants_payload = data
-    # mapping_response = get_mapping_response("user", f"success#{data.get('user_id')}")
-    # user_id = mapping_response.get("data", {}).get("v2_value", "")
-    # if not user_id:
-    #     return get_failed_msg("user", data.get("user_id"))
-    # participants_payload["user_id"] = user_id
-    participants_payload["loan_application_id"] = response.get("response", {}).get("data", {}).get("loan_application_id")
-    participants_payload = json.loads(json.dumps(participants_payload, cls=DecimalEncoder))
+def create_participants_payload(participants_list, token, response):
+    participants_payload_list = []
+    for participant_info in participants_list:
+        participant_payload = {
+            "participant_id": participant_info.get("participant_id"),
+            "name": participant_info.get("name"),
+            "role": participant_info.get("role")
+        }
+        participants_payload_list.append(participant_payload)
+
+    payload = {
+        "record_create_list": participants_payload_list
+    }
+
     return {
-        "url": f"{args['mock_url']}/participants",
-        "headers": {'Authorization': token, 'x-mock-response-code': "201"},
+        "url": args['participants_url'],
+        "headers": {'Authorization': token},
         "payload": {
             "wfe_app_id": "infin8v2",
-            "entity_id": "participants",
-            "api_request": json.dumps(participants_payload)
+            "entity_id": "",
+            "api_request": json.dumps(payload)
         }
     }
 
-def create_sign_submission_status_payload(data, token, response):
-    sign_submission_status_payload = data
-    sign_submission_status_payload["loan_application_id"] = response.get("response", {}).get("data", {}).get("loan_application_id")
-    # sign_submission_status_payload["borrower_id"] = response.get("response", {}).get("data", {}).get("borrower_id")
-    sign_submission_status_payload = json.loads(json.dumps(sign_submission_status_payload, cls=DecimalEncoder))
+def create_sign_submission_status_payload(status_list, token, response):
+    status_payload_list = []
+    for status_info in status_list:
+        status_payload = {
+            "submission_id": status_info.get("submission_id"),
+            "status": status_info.get("status"),
+            "timestamp": status_info.get("timestamp")
+        }
+        status_payload_list.append(status_payload)
+
+    payload = {
+        "record_create_list": status_payload_list
+    }
+
     return {
-        "url": f"{args['mock_url']}/sign_submission_status",
-        "headers": {'Authorization': token, 'x-mock-response-code': "201"},
+        "url": args['sign_submission_status_url'],
+        "headers": {'Authorization': token},
         "payload": {
             "wfe_app_id": "infin8v2",
-            "entity_id": "sign_submission_status",
-            "api_request": json.dumps(sign_submission_status_payload)
+            "entity_id": "",
+            "api_request": json.dumps(payload)
         }
     }
 
-def create_credit_consent_payload(data, token, response):
-    credit_consent_payload = data
-    credit_consent_payload["loan_application_id"] = response.get("response", {}).get("data", {}).get("loan_application_id")
-    # credit_consent_payload["borrower_id"] = response.get("response", {}).get("data", {}).get("borrower_id")    
-    credit_consent_payload = json.loads(json.dumps(credit_consent_payload, cls=DecimalEncoder))
+def create_credit_consent_payload(consent_list, token, response):
+    consent_payload_list = []
+    for consent_info in consent_list:
+        consent_payload = {
+            "consent_id": consent_info.get("consent_id"),
+            "consent_status": consent_info.get("consent_status"),
+            "timestamp": consent_info.get("timestamp")
+        }
+        consent_payload_list.append(consent_payload)
+
+    payload = {
+        "record_create_list": consent_payload_list
+    }
+
     return {
-        "url": f"{args['mock_url']}/credit_consent",
-        "headers": {'Authorization': token, 'x-mock-response-code': "201"},
+        "url": args['credit_consent_url'],
+        "headers": {'Authorization': token},
         "payload": {
             "wfe_app_id": "infin8v2",
-            "entity_id": "credit_consent",
-            "api_request": json.dumps(credit_consent_payload)
+            "entity_id": "",
+            "api_request": json.dumps(payload)
         }
     }
 
-def create_credit_pull_payload(data, token, response):
-    credit_pull_payload = data
-    credit_pull_payload["loan_application_id"] = response.get("response", {}).get("data", {}).get("loan_application_id")
-    # credit_pull_payload["borrower_id"] = response.get("response", {}).get("data", {}).get("borrower_id")
-    # credit_pull_payload["consent_id"] = response.get("response", {}).get("data", {}).get("consent_id")
-    credit_pull_payload = json.loads(json.dumps(credit_pull_payload, cls=DecimalEncoder))
+def create_credit_pull_payload(pull_list, token, response):
+    pull_payload_list = []
+    for pull_info in pull_list:
+        pull_payload = {
+            "pull_id": pull_info.get("pull_id"),
+            "credit_score": pull_info.get("credit_score"),
+            "timestamp": pull_info.get("timestamp")
+        }
+        pull_payload_list.append(pull_payload)
+
+    payload = {
+        "record_create_list": pull_payload_list
+    }
+
     return {
-        "url": f"{args['mock_url']}/credit_pull",
-        "headers": {'Authorization': token, 'x-mock-response-code': "201"},
+        "url": args['credit_pull_url'],
+        "headers": {'Authorization': token},
         "payload": {
             "wfe_app_id": "infin8v2",
-            "entity_id": "credit_pull",
-            "api_request": json.dumps(credit_pull_payload)
+            "entity_id": "",
+            "api_request": json.dumps(payload)
         }
     }
 
-def create_reference_mapping_payload(data, token, response):
-    reference_mapping_payload =  data
-    # reference_mapping_payload["sub_entity_type"] = "loan_application_borrower"
-    # reference_mapping_payload["sub_entity_application_id"] = response.get("response", {}).get("data", {}).get("borrower_id")
-    reference_mapping_payload = json.loads(json.dumps(reference_mapping_payload, cls=DecimalEncoder))
+def create_reference_mapping_payload(mapping_list, token, response):
+    mapping_payload_list = []
+    for mapping_info in mapping_list:
+        mapping_payload = {
+            "mapping_id": mapping_info.get("mapping_id"),
+            "source": mapping_info.get("source"),
+            "target": mapping_info.get("target")
+        }
+        mapping_payload_list.append(mapping_payload)
+
+    payload = {
+        "record_create_list": mapping_payload_list
+    }
 
     return {
-        "url": f"{args['mock_url']}/reference_mapping",
-        "headers": {'Authorization': token, 'x-mock-response-code': "201"},
+        "url": args['reference_mapping_url'],
+        "headers": {'Authorization': token},
         "payload": {
             "wfe_app_id": "infin8v2",
-            "entity_id": "loan_application_external_reference_mapping",
-            "api_request": json.dumps(reference_mapping_payload)
+            "entity_id": "",
+            "api_request": json.dumps(payload)
         }
     }
 
@@ -654,6 +801,8 @@ def filter_payload_keys(payload: dict, *keys_to_remove: str) -> dict:
         return {}
 
 
+
+
 # ----process-api-response-------------------------------------------------------
 
 def process_response(response_json):
@@ -693,6 +842,38 @@ def process_response(response_json):
     except Exception as e:
         return {'isSuccess': False, 'error': str(e)}
 
+
+def process_bulk_response(response_json):
+    """
+    Processes the bulk API response and standardizes the result format.
+    """
+    try:
+        if 'result' in response_json:
+            results = response_json['result']
+            processed_results = []
+
+            for result in results:
+                status_code = result.get('statusCode')
+                is_success = status_code == 200
+                processed_result = {
+                    'isSuccess': is_success,
+                    'response' if is_success else 'error': result
+                }
+                processed_results.append(processed_result)
+
+            return {
+                'isSuccess': response_json.get('header_status_code') == 200,
+                'results': processed_results,
+                'total_record_created_success_count': response_json.get('total_record_created_success_count', 0),
+                'total_record_created_failure_count': response_json.get('total_record_created_failure_count', 0),
+                'total_records_count': response_json.get('total_records_count', 0)
+            }
+        
+        return {'isSuccess': False, 'error': 'Invalid response format'}
+        
+    except Exception as e:
+        return {'isSuccess': False, 'error': str(e)}
+ 
 # ----get-v2-id-for-mapping------------------------------------------------------
 
 def get_v2_id(api_response: dict | None) -> str | None:
@@ -955,16 +1136,15 @@ def process_lender(record, token):
 
     # second payload
     bdm_list = record.get("lender_business_development_manager", [])
-    for bdm in bdm_list:
-        bdm_payload = create_bdm_payload(bdm, token, response)
-        pk = record.get('pk')
-        sk_id = f"{record.get('sk')}#bdm#{uuid.uuid4()}"
-        result = handle_failed_payload_creation(record, bdm_payload, pk, sk_id)
-        if result: return
-        
-        response, new_token, sent_payload = executeApi(bdm_payload, token)
-        token = new_token if new_token else token
-        updateMapping(response, record, sent_payload, sk_id)
+    bdm_payload = create_bdm_payload(bdm_list, token, response)
+    pk = record.get('pk')
+    sk_id = f"{record.get('sk')}#bdm"
+    result = handle_failed_payload_creation(record, bdm_payload, pk, sk_id)
+    if result: return
+
+    response, new_token, sent_payload = exectueBulkAPI(bdm_payload, token)
+    token = new_token if new_token else token
+    updateMappingForBulkResponses(response, record, sent_payload, sk_id)
 
 def process_deal(record, token):
     deal_payload = create_deal_payload(record, token)
@@ -1003,77 +1183,73 @@ def process_deal(record, token):
 
 
     fees_list = record.get("fees", [])
-    for fees in fees_list:
-        fees_payload = create_fees_payload(fees, token, dealresponse)
-        pk = record.get('pk')
-        sk_id = f"{record.get('sk')}#fees#{uuid.uuid4()}"
-        result = handle_failed_payload_creation(record, fees_payload, pk, sk_id)
-        if result: return
+    fees_payload = create_fees_payload(fees_list, token, dealresponse)
+    pk = record.get('pk')
+    sk_id = f"{record.get('sk')}#fees"
+    result = handle_failed_payload_creation(record, fees_payload, pk, sk_id)
+    if result: return
 
-        response, new_token, sent_payload = executeApi(fees_payload, token)
-        token = new_token if new_token else token
-        updateMapping(response, record, sent_payload, sk_id)
+    response, new_token, sent_payload = exectueBulkAPI(fees_payload, token)
+    token = new_token if new_token else token
+    updateMappingForBulkResponses(response, record, sent_payload, sk_id)
 
     participants_list = record.get("participants", [])
-    for participants in participants_list:
-        participants_payload = create_participants_payload(participants, token, dealresponse)
-        pk = record.get('pk')
-        sk_id = f"{record.get('sk')}#participants#{uuid.uuid4()}"
-        result = handle_failed_payload_creation(record, participants_payload, pk, sk_id)
-        if result: return
+    participants_payload = create_participants_payload(participants_list, token, dealresponse)
+    pk = record.get('pk')
+    sk_id = f"{record.get('sk')}#participants"
+    result = handle_failed_payload_creation(record, participants_payload, pk, sk_id)
+    if result: return
 
-        response, new_token, sent_payload = executeApi(participants_payload, token)
-        token = new_token if new_token else token
-        updateMapping(response, record, sent_payload, sk_id)
+    response, new_token, sent_payload = exectueBulkAPI(participants_payload, token)
+    token = new_token if new_token else token   
+    updateMappingForBulkResponses(response, record, sent_payload, sk_id)
     
     sign_submission_list = record.get("sign_submission_status", [])
-    for sign_submission in sign_submission_list:
-        sign_submission_status_payload = create_sign_submission_status_payload(sign_submission, token, dealresponse)
-        pk = record.get('pk')
-        sk_id = f"{record.get('sk')}#sign_submission_status#{uuid.uuid4()}"
-        result = handle_failed_payload_creation(record, sign_submission_status_payload, pk, sk_id)
-        if result: return
+    sign_submission_payload = create_sign_submission_status_payload(sign_submission_list, token, dealresponse)
+    pk = record.get('pk')
+    sk_id = f"{record.get('sk')}#sign_submission_status"
+    result = handle_failed_payload_creation(record, sign_submission_payload, pk, sk_id)
+    if result: return
 
-        response, new_token, sent_payload = executeApi(sign_submission_status_payload, token)
-        token = new_token if new_token else token
-        updateMapping(response, record, sent_payload, sk_id)
+    response, new_token, sent_payload = exectueBulkAPI(sign_submission_payload, token)
+    token = new_token if new_token else token
+    updateMappingForBulkResponses(response, record, sent_payload, sk_id)
     
     
     credit_consent_list = record.get("credit_consent", [])
-    for credit_consent in credit_consent_list:
-        credit_consent_payload = create_credit_consent_payload(credit_consent, token, dealresponse)
-        pk = record.get('pk')
-        sk_id = f"{record.get('sk')}#credit_consent#{uuid.uuid4()}"
-        result = handle_failed_payload_creation(record, credit_consent_payload, pk, sk_id)
-        if result: return
+    credit_consent_payload = create_credit_consent_payload(credit_consent_list, token, dealresponse)
+    pk = record.get('pk')
+    sk_id = f"{record.get('sk')}#credit_consent"
+    result = handle_failed_payload_creation(record, credit_consent_payload, pk, sk_id)
+    if result: return
 
-        response, new_token, sent_payload = executeApi(credit_consent_payload, token)
-        token = new_token if new_token else token
-        updateMapping(response, record, sent_payload, sk_id)
+    response, new_token, sent_payload = exectueBulkAPI(credit_consent_payload, token)
+    token = new_token if new_token else token
+    updateMappingForBulkResponses(response, record, sent_payload, sk_id)
+
 
     credit_pull_list = record.get("credit_pull", [])
-    for credit_pull in credit_pull_list:
-        credit_pull_payload = create_credit_pull_payload(credit_pull, token, dealresponse)
-        pk = record.get('pk')
-        sk_id = f"{record.get('sk')}#credit_pull#{uuid.uuid4()}"
-        result = handle_failed_payload_creation(record, credit_pull_payload, pk, sk_id)
-        if result: return
+    credit_pull_payload = create_credit_pull_payload(credit_pull_list, token, dealresponse)
+    pk = record.get('pk')
+    sk_id = f"{record.get('sk')}#credit_pull"
+    result = handle_failed_payload_creation(record, credit_pull_payload, pk, sk_id)
+    if result: return
 
-        response, new_token, sent_payload = executeApi(credit_pull_payload, token)
-        token = new_token if new_token else token
-        updateMapping(response, record, sent_payload, sk_id)
+    response, new_token, sent_payload = exectueBulkAPI(credit_pull_payload, token)
+    token = new_token if new_token else token
+    updateMappingForBulkResponses(response, record, sent_payload, sk_id)
+    
 
     reference_mapping_list = record.get("refrence_mapping", [])
-    for reference_mapping in reference_mapping_list:
-        reference_mapping_payload = create_reference_mapping_payload(reference_mapping, token, dealresponse)
-        pk = record.get('pk')
-        sk_id = f"{record.get('sk')}#refrence_mapping#{uuid.uuid4()}"
-        result = handle_failed_payload_creation(record, reference_mapping_payload, pk, sk_id)
-        if result: return
+    reference_mapping_payload = create_reference_mapping_payload(reference_mapping_list, token, dealresponse)
+    pk = record.get('pk')
+    sk_id = f"{record.get('sk')}#refrence_mapping"
+    result = handle_failed_payload_creation(record, reference_mapping_payload, pk, sk_id)
+    if result: return
 
-        response, new_token, sent_payload = executeApi(reference_mapping_payload, token)
-        token = new_token if new_token else token
-        updateMapping(response, record, sent_payload, sk_id)
+    response, new_token, sent_payload = exectueBulkAPI(reference_mapping_payload, token)
+    token = new_token if new_token else token
+    updateMappingForBulkResponses(response, record, sent_payload, sk_id)
     
 
 def process_deal_note(record, token):

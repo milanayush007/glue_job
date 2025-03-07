@@ -174,11 +174,10 @@ def updateMappingForBulkResponses(response_json, item, sent_payload, sk_id):
     Processes the bulk API result and updates DynamoDB accordingly.
     """
     try:
-        if 'result' in response_json:
-            results = response_json['result']
+        if 'results' in response_json:
+            results = response_json['results']
             for result in results:
-                status_code = result.get('statusCode')
-                is_success = status_code == 200
+                is_success = result.get('isSuccess')
                 pk = item.get('pk')
                 sk_base = str(item.get('sk'))
                 content_json = json.dumps(sent_payload)
@@ -204,12 +203,12 @@ def updateMappingForBulkResponses(response_json, item, sent_payload, sk_id):
                     create_dynamo_record(
                         table=table,
                         pk=pk,
-                        sk=f"failed#{sk_base}#{sub_entity}#{uuid.uuid4()}",
+                        sk=f"failed#{sk_base}#{sk_id}#{uuid.uuid4()}",
                         v1_value=sk_base,
                         result='failed',
                         payload=content_json,
                         error_msg=str(result.get('error', 'Unknown error')),
-                        response=result.get('response', {})
+                        response=result.get('error', {})
                     )
                     print(f"API call failed: {result.get('error', 'Unknown error')}")
         else:
@@ -386,7 +385,7 @@ def create_bdm_payload(bdm_list, token, response):
     bdm_payload_list = []
     for bdm_info in bdm_list:
         bdm_payload = {
-            "lender_id": response.get("response", {}).get("data", {}).get("loan_lender_application_id"),
+            "lender_id": response.get("response").get("data", {}).get("loan_lender_application_id"),
             "email_address": bdm_info.get("email_address"),
             "name": bdm_info.get("name"),
             "office_number": bdm_info.get("office_number"),
@@ -398,13 +397,14 @@ def create_bdm_payload(bdm_list, token, response):
     payload = {
         "record_create_list": bdm_payload_list
     }
+    print(payload)
 
     return {
-        "url": args['bdm_url'],
+        "url": args['bulk_url'],
         "headers": {'Authorization': token},
         "payload": {
             "wfe_app_id": "infin8v2",
-            "entity_id": "",
+            "entity_id": "lender_business_development_manager",
             "api_request": json.dumps(payload)
         }
     }
@@ -848,8 +848,9 @@ def process_bulk_response(response_json):
     Processes the bulk API response and standardizes the result format.
     """
     try:
-        if 'result' in response_json:
-            results = response_json['result']
+        if 'api_response' in response_json:
+            api_response = json.loads(response_json['api_response'])
+            results = api_response.get('result', [])
             processed_results = []
 
             for result in results:
@@ -862,7 +863,7 @@ def process_bulk_response(response_json):
                 processed_results.append(processed_result)
 
             return {
-                'isSuccess': response_json.get('header_status_code') == 200,
+                # 'isSuccess': response_json.get('header_status_code') == 200,
                 'results': processed_results,
                 'total_record_created_success_count': response_json.get('total_record_created_success_count', 0),
                 'total_record_created_failure_count': response_json.get('total_record_created_failure_count', 0),
@@ -883,7 +884,7 @@ def get_v2_id(api_response: dict | None) -> str | None:
         return None
     
     try:
-        response_data = api_response.get('result') or api_response.get('data') or {}
+        response_data = api_response.get('result') or api_response.get('data') or api_response.get('response') or {}
 
         if not isinstance(response_data, dict):
             print(f"Invalid result type: {type(response_data)}")
@@ -1330,7 +1331,7 @@ def main(glueContext, dfc) -> DynamicFrameCollection:
     return dfc
 
 
-args = getResolvedOptions(sys.argv, ['JOB_NAME', 'OPERATION', 'org_url', 'user_url', 'lender_url', 'bdm_url', 'auth_url', 'client_id', 'username', 'password', 'client_secret', 'contact_url', 'contact_task_url','contact_note_url', 'mock_url'])
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'OPERATION', 'bulk_url', 'org_url', 'user_url', 'lender_url', 'bdm_url', 'auth_url', 'client_id', 'username', 'password', 'client_secret', 'contact_url', 'contact_task_url','contact_note_url', 'mock_url'])
 sc = SparkContext()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
